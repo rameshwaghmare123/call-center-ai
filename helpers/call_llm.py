@@ -1,408 +1,191 @@
 import asyncio
-import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 
+# from helpers.call_utils import
+import numpy as np
 from azure.communication.callautomation.aio import CallAutomationClient
-from openai import APIError
+from rtclient import (
+    InputAudioTranscription,
+    RTClient,
+    RTInputItem,
+    RTOutputItem,
+    RTResponse,
+    ServerVAD,
+)
+from scipy.signal import resample
 
-from helpers.call_utils import (
-    handle_clear_queue,
-    handle_media,
-    handle_recognize_text,
-    tts_sentence_split,
-)
 from helpers.config import CONFIG
-from helpers.features import answer_hard_timeout_sec, answer_soft_timeout_sec
+from helpers.features import phone_silence_timeout_sec
 from helpers.llm_tools import LlmPlugins
-from helpers.llm_worker import (
-    MaximumTokensReachedError,
-    SafetyCheckError,
-    completion_stream,
-)
 from helpers.logging import logger
 from helpers.monitoring import tracer
 from models.call import CallStateModel
-from models.message import (
-    ActionEnum as MessageAction,
-    MessageModel,
-    PersonaEnum as MessagePersonaEnum,
-    StyleEnum as MessageStyleEnum,
-    ToolModel as MessageToolModel,
-    extract_message_style,
-    remove_message_action,
-)
 
 _cache = CONFIG.cache.instance()
 _db = CONFIG.database.instance()
 
 
-# TODO: Refacto, this function is too long (and remove PLR0912/PLR0915 ignore)
 @tracer.start_as_current_span("call_load_llm_chat")
-async def load_llm_chat(  # noqa: PLR0912, PLR0915
+async def load_llm_chat(
+    audio_length: int,
+    audio_sample_rate: int,
+    audio_stream: AsyncGenerator[bytes, None],
+    automation_client: CallAutomationClient,
     call: CallStateModel,
-    client: CallAutomationClient,
     post_callback: Callable[[CallStateModel], Awaitable[None]],
     training_callback: Callable[[CallStateModel], Awaitable[None]],
-    _iterations_remaining: int = 3,
 ) -> CallStateModel:
-    """
-    Handle the intelligence of the call, including: LLM chat, TTS, and media play.
-
-    Play the loading sound while waiting for the intelligence to be processed. If the intelligence is not processed after few secs, play the timeout sound. If the intelligence is not processed after more secs, stop the intelligence processing and play the error sound.
-
-    Returns the updated call model.
-    """
-    logger.info("Loading LLM chat")
-
-    play_loading_sound = True
-
-    async def _tts_callback(text: str, style: MessageStyleEnum) -> None:
-        """
-        Send back the TTS to the user.
-        """
-        nonlocal play_loading_sound
-
-        # Disable loading sound when LLM starts to speak
-        if play_loading_sound:
-            # First, clear remaining loading sound
-            await handle_clear_queue(
-                call=call,
-                client=client,
-            )
-            # Then, disable loading sound
-            play_loading_sound = False
-
-        await asyncio.gather(
-            handle_recognize_text(
-                call=call,
-                client=client,
-                style=style,
-                text=text,
-            ),  # First, recognize the next voice
-            _db.call_aset(
-                call
-            ),  # Second, save in DB allowing (1) user to cut off the Assistant and (2) SMS answers to be in order
-        )
-
-    # Pointer
-    pointer_cache_key = f"{__name__}-load_llm_chat-pointer-{call.call_id}"
-    pointer_current = time.time()  # Get system current time
-    await _cache.aset(
-        key=pointer_cache_key,
-        ttl_sec=await answer_hard_timeout_sec(),
-        value=str(pointer_current),
-    )
-
-    # Chat
-    chat_task = asyncio.create_task(
-        _execute_llm_chat(
-            call=call,
-            client=client,
-            post_callback=post_callback,
-            use_tools=_iterations_remaining > 0,
-            tts_callback=_tts_callback,
-        )
-    )
-
-    # Loading
-    def _loading_task() -> asyncio.Task:
-        return asyncio.create_task(asyncio.sleep(loading_timer))
-
-    loading_timer = 5  # Play loading sound every 5 secs
-    loading_task = _loading_task()
-
-    # Timeouts
-    soft_timeout_triggered = False
-    soft_timeout_task = asyncio.create_task(
-        asyncio.sleep(await answer_soft_timeout_sec())
-    )
-    hard_timeout_task = asyncio.create_task(
-        asyncio.sleep(await answer_hard_timeout_sec())
-    )
-
-    def _clear_tasks() -> None:
-        chat_task.cancel()
-        hard_timeout_task.cancel()
-        loading_task.cancel()
-        soft_timeout_task.cancel()
-
-    is_error = True
-    continue_chat = True
-    try:
-        while True:
-            logger.debug("Chat task status: %s", chat_task.done())
-
-            if pointer_current < float(
-                (await _cache.aget(pointer_cache_key) or b"0").decode()
-            ):  # Test if pointer updated by another instance
-                logger.warning("Another chat is running, stopping this one")
-                # Clean up Communication Services queue
-                await handle_clear_queue(call=call, client=client)
-                # Clean up tasks
-                _clear_tasks()
-                break
-
-            if chat_task.done():  # Break when chat coroutine is done
-                # Clean up
-                _clear_tasks()
-                # Get result
-                is_error, continue_chat, call = (
-                    chat_task.result()
-                )  # Store updated chat model
-                await training_callback(call)  # Trigger trainings generation
-                await _db.call_aset(
-                    call
-                )  # Save ASAP in DB allowing (1) user to cut off the Assistant and (2) SMS answers to be in order
-                break
-
-            if hard_timeout_task.done():  # Break when hard timeout is reached
-                logger.warning(
-                    "Hard timeout of %ss reached",
-                    await answer_hard_timeout_sec(),
-                )
-                # Clean up
-                _clear_tasks()
-                break
-
-            if play_loading_sound:  # Catch timeout if async loading is not started
-                if (
-                    soft_timeout_task.done() and not soft_timeout_triggered
-                ):  # Speak when soft timeout is reached
-                    logger.warning(
-                        "Soft timeout of %ss reached",
-                        await answer_soft_timeout_sec(),
-                    )
-                    soft_timeout_triggered = True
-                    # Never store the error message in the call history, it has caused hallucinations in the LLM
-                    await handle_recognize_text(
-                        call=call,
-                        client=client,
-                        store=False,
-                        text=await CONFIG.prompts.tts.timeout_loading(call),
-                    )
-
-                elif loading_task.done():  # Do not play timeout prompt plus loading, it can be frustrating for the user
-                    loading_task = _loading_task()
-                    await handle_media(
-                        call=call,
-                        client=client,
-                        sound_url=CONFIG.prompts.sounds.loading(),
-                    )  # Play loading sound
-
-            # Wait to not block the event loop for other requests
-            await asyncio.sleep(1)
-
-    except Exception:
-        logger.warning("Error loading intelligence", exc_info=True)
-
-    if is_error:  # Error during chat
-        if not continue_chat or _iterations_remaining < 1:  # Maximum retries reached
-            logger.warning("Maximum retries reached, stopping chat")
-            content = await CONFIG.prompts.tts.error(call)
-            # Speak the error
-            await _tts_callback(content, MessageStyleEnum.NONE)
-            # Never store the error message in the call history, it has caused hallucinations in the LLM
-
-        else:  # Retry chat after an error
-            logger.info("Retrying chat, %s remaining", _iterations_remaining - 1)
-            return await load_llm_chat(
-                call=call,
-                client=client,
-                post_callback=post_callback,
-                training_callback=training_callback,
-                _iterations_remaining=_iterations_remaining - 1,
-            )
-    else:
-        if continue_chat and _iterations_remaining > 0:  # Contiue chat
-            logger.info("Continuing chat, %s remaining", _iterations_remaining - 1)
-            return await load_llm_chat(
-                call=call,
-                client=client,
-                post_callback=post_callback,
-                training_callback=training_callback,
-                _iterations_remaining=_iterations_remaining - 1,
-            )  # Recursive chat (like for for retry or tools)
-
-        # End chat
-        await handle_recognize_text(
-            call=call,
-            client=client,
-            no_response_error=True,
-            style=MessageStyleEnum.NONE,
-            text=None,
-        )  # Trigger an empty text to recognize and generate timeout error if user does not speak
-
-    return call
-
-
-# TODO: Refacto, this function is too long (and remove PLR0911/PLR0912/PLR0915 ignore)
-@tracer.start_as_current_span("call_execute_llm_chat")
-async def _execute_llm_chat(  # noqa: PLR0911, PLR0912, PLR0915
-    call: CallStateModel,
-    client: CallAutomationClient,
-    post_callback: Callable[[CallStateModel], Awaitable[None]],
-    tts_callback: Callable[[str, MessageStyleEnum], Awaitable[None]],
-    use_tools: bool,
-) -> tuple[bool, bool, CallStateModel]:
-    """
-    Perform the chat with the LLM model.
-
-    This function will handle:
-
-    - The chat with the LLM model (incl system prompts, tools, and user callback)
-    - Retry as possible if the LLM model fails to return a response
-
-    Returns a tuple with:
-
-    1. `bool`, notify error
-    2. `bool`, should retry chat
-    3. `CallStateModel`, the updated model
-    """
-    logger.debug("Running LLM chat")
-    content_full = ""
-
-    async def _buffer_callback(text: str, style: MessageStyleEnum) -> None:
-        nonlocal content_full
-        content_full += f" {text}"
-        await tts_callback(text, style)
-
-    async def _content_callback(
-        buffer: str, style: MessageStyleEnum
-    ) -> MessageStyleEnum:
-        # Remove tool calls from buffer content and detect style
-        local_style, local_content = extract_message_style(
-            remove_message_action(buffer)
-        )
-        new_style = local_style or style
-        if local_content:
-            await tts_callback(local_content, new_style)
-        return new_style
-
-    # Build RAG
-    trainings = await call.trainings()
-    logger.info("Enhancing LLM chat with %s trainings", len(trainings))
-    logger.debug("Trainings: %s", trainings)
-
-    # System prompts
-    system = CONFIG.prompts.llm.chat_system(
-        call=call,
-        trainings=trainings,
-    )
+    # Create client
+    rtc_client, llm_model = await CONFIG.llm.realtime.instance()
 
     # Build plugins
     plugins = LlmPlugins(
         call=call,
-        client=client,
+        client=automation_client,
         post_callback=post_callback,
-        tts_callback=_buffer_callback,
+    )
+    tools = await plugins.to_openai(call)
+
+    # Configure LLM
+    await rtc_client.configure(
+        input_audio_format="pcm16",
+        input_audio_transcription=InputAudioTranscription(model="whisper-1"),
+        modalities={"text"},
+        temperature=0,
+        tool_choice="auto",
+        tools=tools,
+        turn_detection=ServerVAD(silence_duration_ms=phone_silence_timeout_sec),
     )
 
-    tools = []
-    if not use_tools:
-        logger.warning("Tools disabled for this chat")
-    else:
-        tools = await plugins.to_openai(call)
-        logger.debug("Tools: %s", tools)
+    # Run in/out tasks
+    await asyncio.gather(
+        _in_audio(
+            client=rtc_client,
+            duration_ms=audio_length,
+            sample_rate=audio_sample_rate,
+            stream=audio_stream,
+        ),
+        _out_messages(
+            automation_client=automation_client,
+            call=call,
+            client=rtc_client,
+            post_callback=post_callback,
+            training_callback=training_callback,
+        ),
+    )
 
-    # Execute LLM inference
-    maximum_tokens_reached = False
-    content_buffer_pointer = 0
-    tool_calls_buffer: dict[int, MessageToolModel] = {}
-    try:
-        async for delta in completion_stream(
-            max_tokens=160,  # Lowest possible value for 90% of the cases, if not sufficient, retry will be triggered, 100 tokens ~= 75 words, 20 words ~= 1 sentence, 6 sentences ~= 160 tokens
-            messages=call.messages,
-            system=system,
-            tools=tools,
-        ):
-            if not delta.content:
-                for piece in delta.tool_calls or []:
-                    tool_calls_buffer[piece.index] = tool_calls_buffer.get(
-                        piece.index, MessageToolModel()
-                    )
-                    tool_calls_buffer[piece.index] += piece
-            else:
-                # Store whole content
-                content_full += delta.content
-                for sentence, length in tts_sentence_split(
-                    content_full[content_buffer_pointer:], False
-                ):
-                    content_buffer_pointer += length
-                    plugins.style = await _content_callback(sentence, plugins.style)
-    except MaximumTokensReachedError:  # Retry on maximum tokens reached
-        logger.warning("Maximum tokens reached for this completion, retry asked")
-        maximum_tokens_reached = True
-    except APIError as e:  # Retry on API error
-        logger.warning("OpenAI API call error: %s", e)
-        return True, True, call  # Error, retry
-    except SafetyCheckError as e:  # Last user message is trash, remove it
-        logger.warning("Safety Check error: %s", e)
-        if last_message := next(
-            (
-                call
-                for call in reversed(call.messages)
-                if call.persona == MessagePersonaEnum.HUMAN
-                and call.action in [MessageAction.SMS, MessageAction.TALK]
-            ),
-            None,
-        ):  # Remove last user message
-            call.messages.remove(last_message)
-        return True, False, call  # Error, no retry
+    # Return updated call
+    return call
 
-    # Flush the remaining buffer
-    if content_buffer_pointer < len(content_full):
-        plugins.style = await _content_callback(
-            content_full[content_buffer_pointer:], plugins.style
-        )
 
-    # Convert tool calls buffer
-    tool_calls = [tool_call for _, tool_call in tool_calls_buffer.items()]
+async def _out_messages(
+    automation_client: CallAutomationClient,
+    call: CallStateModel,
+    client: RTClient,
+    post_callback: Callable[[CallStateModel], Awaitable[None]],
+    training_callback: Callable[[CallStateModel], Awaitable[None]],
+) -> None:
+    await asyncio.gather(
+        _out_messages_items(client=client),
+        _out_messages_control(client=client),
+    )
 
-    # Delete action and style from the message as they are in the history and LLM hallucinates them
-    _, content_full = extract_message_style(remove_message_action(content_full))
 
-    logger.debug("Chat response: %s", content_full)
-    logger.debug("Tool calls: %s", tool_calls)
+async def _out_messages_control(client: RTClient) -> None:
+    async for control in client.control_messages():
+        if control is not None:
+            print(f"Received a control message: {control.type}")
+        else:
+            break
 
-    # OpenAI GPT-4 Turbo sometimes return wrong tools schema, in that case, retry within limits
-    # TODO: Tries to detect this error earlier
-    # See: https://community.openai.com/t/model-tries-to-call-unknown-function-multi-tool-use-parallel/490653
-    if any(
-        tool_call.function_name == "multi_tool_use.parallel" for tool_call in tool_calls
-    ):
-        logger.warning('LLM send back invalid tool schema "multi_tool_use.parallel"')
-        return True, True, call  # Error, retry
 
-    # OpenAI GPT-4 Turbo tends to return empty content, in that case, retry within limits
-    if not content_full and not tool_calls:
-        logger.warning("Empty content, retrying")
-        return True, True, call  # Error, retry
+async def _out_item(item: RTOutputItem):
+    arguments = None
+    audio_transcript = None
+    text_data = None
 
-    # Execute tools
-    tool_tasks = [tool_call.execute_function(plugins) for tool_call in tool_calls]
-    await asyncio.gather(*tool_tasks)
-    call = plugins.call  # Update call model if object reference changed
+    async for chunk in item:
+        if chunk.type == "audio_transcript":
+            audio_transcript = (audio_transcript or "") + chunk.data
+        elif chunk.type == "tool_call_arguments":
+            arguments = (arguments or "") + chunk.data
+        elif chunk.type == "text":
+            text_data = (text_data or "") + chunk.data
 
-    # Store message
-    if call.messages[-1].persona == MessagePersonaEnum.ASSISTANT:
-        message = call.messages[-1]
-        message.content = content_full.strip()
-        message.style = plugins.style
-        message.tool_calls = tool_calls
-    else:
-        call.messages.append(
-            MessageModel(
-                content=content_full.strip(),
-                persona=MessagePersonaEnum.ASSISTANT,
-                style=plugins.style,
-                tool_calls=tool_calls,
+    if text_data is not None:
+        logger.info(f"Text: {text_data}")
+    if audio_transcript is not None:
+        logger.info(f"Audio Transcript: {audio_transcript}")
+    if arguments is not None:
+        logger.info(f"Tool Call Arguments: {arguments}")
+
+
+async def _out_response(client: RTClient, response: RTResponse):
+    prefix = f"[response={response.id}]"
+    async for item in response:
+        print(prefix, f"Received item {item.id}")
+        asyncio.create_task(_out_item(item=item))
+    print(prefix, "Response completed")
+    await client.close()
+
+
+async def _out_input_item(item: RTInputItem):
+    prefix = f"[input_item={item.id}]"
+    await item
+    print(prefix, f"Previous Id: {item.previous_id}")
+    print(prefix, f"Transcript: {item.transcript}")
+    print(prefix, f"Audio Start [ms]: {item.audio_start_ms}")
+    print(prefix, f"Audio End [ms]: {item.audio_end_ms}")
+
+
+async def _out_messages_items(client: RTClient) -> None:
+    async for item in client.items():
+        if isinstance(item, RTResponse):
+            asyncio.create_task(
+                _out_response(
+                    response=item,
+                    client=client,
+                )
             )
-        )
+        else:
+            asyncio.create_task(_out_input_item(item))
 
-    if tool_calls:  # Recusive call if needed
-        return False, True, call
 
-    if maximum_tokens_reached:  # Retry if maximum tokens reached
-        return False, True, call  # TODO: Should we notify an error?
+async def _in_audio(
+    client: RTClient,
+    duration_ms: int,
+    sample_rate: int,
+    stream: AsyncGenerator[bytes, None],
+) -> None:
+    # Resampling parameters
+    target_sample_rate = 24000
+    target_samples_per_chunk = sample_rate * (duration_ms / 1000)
+    target_bytes_per_sample = 2
+    target_bytes_per_chunk = int(target_samples_per_chunk * target_bytes_per_sample)
 
-    return False, False, call  # No error, no retry
+    # Consumes audio stream
+    async for audio_bytes in stream:
+        # Resample audio if necessary
+        if sample_rate != target_sample_rate:
+            audio_chunk = np.frombuffer(audio_bytes, dtype=np.int16)
+            audio_chunk = _resample_audio(
+                data=audio_chunk,
+                original_rate=sample_rate,
+                target_rate=target_sample_rate,
+            )
+            audio_bytes = audio_chunk.tobytes()
+
+        # Send audio in chunks
+        for i in range(0, len(audio_bytes), target_bytes_per_chunk):
+            chunk = audio_bytes[i : i + target_bytes_per_chunk]
+            await client.send_audio(chunk)
+
+
+def _resample_audio(
+    data: np.ndarray,
+    original_rate: int,
+    target_rate: int,
+) -> np.ndarray:
+    samples = round(len(data) * float(target_rate) / original_rate)
+    resampled = resample(x=data, num=samples)
+    return resampled.astype(np.int16)

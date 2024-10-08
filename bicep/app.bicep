@@ -4,16 +4,16 @@ param embeddingModel string
 param embeddingQuota int
 param embeddingVersion string
 param imageVersion string
-param llmFastContext int
-param llmFastDeploymentType string
-param llmFastModel string
-param llmFastQuota int
-param llmFastVersion string
-param llmSlowContext int
-param llmSlowDeploymentType string
-param llmSlowModel string
-param llmSlowQuota int
-param llmSlowVersion string
+param llmRealtimeContext int
+param llmRealtimeDeploymentType string
+param llmRealtimeModel string
+param llmRealtimeQuota int
+param llmRealtimeVersion string
+param llmSequentialContext int
+param llmSequentialDeploymentType string
+param llmSequentialModel string
+param llmSequentialQuota int
+param llmSequentialVersion string
 param location string
 param openaiLocation string
 param promptContentFilter bool
@@ -23,8 +23,8 @@ param tags object
 var appName = 'call-center-ai'
 var prefix = deployment().name
 var appUrl = 'https://call-center-ai.${acaEnv.properties.defaultDomain}'
-var llmFastModelFullName = toLower('${llmFastModel}-${llmFastVersion}')
-var llmSlowModelFullName = toLower('${llmSlowModel}-${llmSlowVersion}')
+var llmRealtimeModelFullName = toLower('${llmRealtimeModel}-${llmRealtimeVersion}')
+var llmSequentialModelFullName = toLower('${llmSequentialModel}-${llmSequentialVersion}')
 var embeddingModelFullName = toLower('${embeddingModel}-${embeddingVersion}')
 var cosmosContainerName = 'calls-v3' // Third schema version
 var localConfig = loadYamlContent('../config.yaml')
@@ -69,25 +69,18 @@ var config = {
     endpoint: cognitiveCommunication.properties.endpoint
   }
   llm: {
-    fast: {
-      mode: 'azure_openai'
-      azure_openai: {
-        context: llmFastContext
-        deployment: llmFast.name
-        endpoint: cognitiveOpenai.properties.endpoint
-        model: llmFastModel
-        streaming: true
-      }
+    realtime: {
+      api_key: cognitiveOpenai.listKeys().key1
+      context: llmRealtimeContext
+      deployment: llmRealtime.name
+      endpoint: cognitiveOpenai.properties.endpoint
+      model: llmRealtimeModel
     }
-    slow: {
-      mode: 'azure_openai'
-      azure_openai: {
-        context: llmSlowContext
-        deployment: llmSlow.name
-        endpoint: cognitiveOpenai.properties.endpoint
-        model: llmSlowModel
-        streaming: true
-      }
+    sequential: {
+      context: llmSequentialContext
+      deployment: llmSequential.name
+      endpoint: cognitiveOpenai.properties.endpoint
+      model: llmSequentialModel
     }
   }
   ai_search: {
@@ -607,44 +600,44 @@ resource contentfilter 'Microsoft.CognitiveServices/accounts/raiPolicies@2024-06
   }
 }
 
-resource llmSlow 'Microsoft.CognitiveServices/accounts/deployments@2024-06-01-preview' = {
+resource llmSequential 'Microsoft.CognitiveServices/accounts/deployments@2024-06-01-preview' = {
   parent: cognitiveOpenai
-  name: llmSlowModelFullName
+  name: llmSequentialModelFullName
   tags: tags
   sku: {
-    capacity: llmSlowQuota
-    name: llmSlowDeploymentType
+    capacity: llmSequentialQuota
+    name: llmSequentialDeploymentType
   }
   properties: {
     raiPolicyName: contentfilter.name
     versionUpgradeOption: 'NoAutoUpgrade'
     model: {
       format: 'OpenAI'
-      name: llmSlowModel
-      version: llmSlowVersion
+      name: llmSequentialModel
+      version: llmSequentialVersion
     }
   }
 }
 
-resource llmFast 'Microsoft.CognitiveServices/accounts/deployments@2024-06-01-preview' = {
+resource llmRealtime 'Microsoft.CognitiveServices/accounts/deployments@2024-06-01-preview' = {
   parent: cognitiveOpenai
-  name: llmFastModelFullName
+  name: llmRealtimeModelFullName
   tags: tags
   sku: {
-    capacity: llmFastQuota
-    name: llmFastDeploymentType
+    capacity: llmRealtimeQuota
+    name: llmRealtimeDeploymentType
   }
   properties: {
     raiPolicyName: contentfilter.name
     versionUpgradeOption: 'NoAutoUpgrade'
     model: {
       format: 'OpenAI'
-      name: llmFastModel
-      version: llmFastVersion
+      name: llmRealtimeModel
+      version: llmRealtimeVersion
     }
   }
   dependsOn: [
-    llmSlow
+    llmSequential
   ]
 }
 
@@ -666,7 +659,7 @@ resource embedding 'Microsoft.CognitiveServices/accounts/deployments@2024-06-01-
     }
   }
   dependsOn: [
-    llmFast
+    llmRealtime
   ]
 }
 

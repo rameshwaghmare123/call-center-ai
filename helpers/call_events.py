@@ -1,9 +1,13 @@
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 
 from azure.communication.callautomation import (
     AzureBlobContainerRecordingStorage,
     DtmfTone,
+    MediaStreamingAudioChannelType,
+    MediaStreamingContentType,
+    MediaStreamingOptions,
+    MediaStreamingTransportType,
     RecognitionChoice,
     RecordingChannel,
     RecordingContent,
@@ -16,12 +20,11 @@ from pydantic import ValidationError
 from helpers.call_llm import load_llm_chat
 from helpers.call_utils import (
     ContextEnum as CallContextEnum,
-    handle_clear_queue,
     handle_hangup,
     handle_play_text,
     handle_recognize_ivr,
-    handle_recognize_text,
     handle_transfer,
+    start_audio_streaming,
 )
 from helpers.config import CONFIG
 from helpers.features import recording_enabled, voice_recognition_retry_max
@@ -50,14 +53,24 @@ async def on_new_call(
     client: CallAutomationClient,
     incoming_context: str,
     phone_number: str,
+    wss_url: str,
 ) -> bool:
     logger.debug("Incoming call handler caller ID: %s", phone_number)
+
+    streaming_options = MediaStreamingOptions(
+        audio_channel_type=MediaStreamingAudioChannelType.UNMIXED,
+        content_type=MediaStreamingContentType.AUDIO,
+        start_media_streaming=False,
+        transport_type=MediaStreamingTransportType.WEBSOCKET,
+        transport_url=wss_url,
+    )
 
     try:
         answer_call_result = await client.answer_call(
             callback_url=callback_url,
             cognitive_services_endpoint=CONFIG.cognitive_service.endpoint,
             incoming_call_context=incoming_context,
+            media_streaming=streaming_options,
         )
         logger.info(
             "Answered call with %s (%s)",
@@ -106,8 +119,6 @@ async def on_call_connected(
         _handle_ivr_language(
             call=call,
             client=client,
-            post_callback=post_callback,
-            training_callback=training_callback,
         ),  # First, every time a call is answered, confirm the language
         _db.call_aset(
             call
@@ -134,39 +145,36 @@ async def on_call_disconnected(
     )
 
 
-@tracer.start_as_current_span("on_speech_recognized")
-async def on_speech_recognized(
+@tracer.start_as_current_span("on_audio_connected")
+async def on_audio_connected(
     call: CallStateModel,
+    channels: int,
     client: CallAutomationClient,
+    encoding: str,
+    in_audio: AsyncGenerator[bytes, None],
+    length: int,
     post_callback: Callable[[CallStateModel], Awaitable[None]],
-    text: str,
+    sample_rate: int,
     training_callback: Callable[[CallStateModel], Awaitable[None]],
 ) -> None:
-    logger.info("Voice recognition: %s", text)
-    span_attribute(CallAttributes.CALL_CHANNEL, "voice")
-    span_attribute(CallAttributes.CALL_MESSAGE, text)
-    call.messages.append(
-        MessageModel(
-            content=text,
-            persona=MessagePersonaEnum.HUMAN,
-        )
+    # Check if the audio is supported
+    # TODO: If Communication Services sends audio in a format that is not supported, we should convert it on the fly
+    if encoding != "pcm":
+        logger.error("Unsupported audio encoding %s", encoding)
+        return
+    if channels != 1:
+        logger.error("Unsupported audio channels %s", channels)
+        return
+
+    await load_llm_chat(
+        audio_length=length,
+        audio_sample_rate=sample_rate,
+        audio_stream=in_audio,
+        automation_client=client,
+        call=call,
+        post_callback=post_callback,
+        training_callback=training_callback,
     )
-    call.recognition_retry = 0  # Reset recognition retry counter
-    await asyncio.gather(
-        handle_clear_queue(
-            call=call,
-            client=client,
-        ),  # First, when the user speak, the conversation should continue based on its last message
-        load_llm_chat(
-            call=call,
-            client=client,
-            post_callback=post_callback,
-            training_callback=training_callback,
-        ),  # Second, the LLM should be loaded to continue the conversation
-        _db.call_aset(
-            call
-        ),  # Third, save in DB allowing SMS responses to be more "in-sync" if they are sent during the generation
-    )  # All in parallel to lower the response latency
 
 
 @tracer.start_as_current_span("on_recognize_timeout_error")
@@ -211,23 +219,6 @@ async def on_recognize_timeout_error(
             client=client,
         )
         return
-
-    # Retry voice recognition
-    span_attribute(CallAttributes.CALL_CHANNEL, "voice")
-    call.recognition_retry += 1
-    logger.info(
-        "Timeout, retrying voice recognition (%s/%s)",
-        call.recognition_retry,
-        await voice_recognition_retry_max(),
-    )
-    # Never store the warning message in the call history, it has caused hallucinations in the LLM
-    await handle_recognize_text(
-        call=call,
-        client=client,
-        no_response_error=True,
-        store=False,
-        text=await CONFIG.prompts.tts.timeout_silence(call),
-    )
 
 
 async def _handle_goodbye(
@@ -331,8 +322,6 @@ async def on_ivr_recognized(
     call: CallStateModel,
     client: CallAutomationClient,
     label: str,
-    post_callback: Callable[[CallStateModel], Awaitable[None]],
-    training_callback: Callable[[CallStateModel], Awaitable[None]],
 ) -> None:
     logger.info("IVR recognized: %s", label)
     span_attribute(CallAttributes.CALL_CHANNEL, "ivr")
@@ -353,35 +342,31 @@ async def on_ivr_recognized(
 
     if len(call.messages) <= 1:  # First call, or only the call action
         await asyncio.gather(
-            handle_recognize_text(
+            handle_play_text(
                 call=call,
                 client=client,
                 text=await CONFIG.prompts.tts.hello(call),
             ),  # First, greet the user
             persist_coro,  # Second, persist language change for next messages, should be quick enough to be in sync with the next message
-            load_llm_chat(
+            start_audio_streaming(
                 call=call,
                 client=client,
-                post_callback=post_callback,
-                training_callback=training_callback,
-            ),  # Third, the LLM should be loaded to continue the conversation
+            ),  # Third, the conversation with the LLM should start
         )  # All in parallel to lower the response latency
 
     else:  # Returning call
         await asyncio.gather(
-            handle_recognize_text(
+            handle_play_text(
                 call=call,
                 client=client,
                 style=MessageStyleEnum.CHEERFUL,
                 text=await CONFIG.prompts.tts.welcome_back(call),
             ),  # First, welcome back the user
             persist_coro,  # Second, persist language change for next messages, should be quick enough to be in sync with the next message
-            load_llm_chat(
+            start_audio_streaming(
                 call=call,
                 client=client,
-                post_callback=post_callback,
-                training_callback=training_callback,
-            ),  # Third, the LLM should be loaded to continue the conversation
+            ),  # Third, the conversation with the LLM should start
         )
 
 
@@ -398,11 +383,10 @@ async def on_transfer_error(
     error_code: int,
 ) -> None:
     logger.info("Error during call transfer, subCode %s", error_code)
-    await handle_recognize_text(
+    await handle_play_text(
         call=call,
         client=client,
         context=CallContextEnum.TRANSFER_FAILED,
-        no_response_error=True,
         text=await CONFIG.prompts.tts.calltransfer_failure(call),
     )
 
@@ -430,12 +414,12 @@ async def on_sms_received(
         logger.info("Call not in progress, answering with SMS")
     else:
         logger.info("Call in progress, answering with voice")
-        await load_llm_chat(
-            call=call,
-            client=client,
-            post_callback=post_callback,
-            training_callback=training_callback,
-        )
+        # await load_llm_chat(
+        #     call=call,
+        #     client=client,
+        #     post_callback=post_callback,
+        #     training_callback=training_callback,
+        # )
     return True
 
 
@@ -592,8 +576,6 @@ async def _intelligence_next(call: CallStateModel) -> None:
 async def _handle_ivr_language(
     call: CallStateModel,
     client: CallAutomationClient,
-    post_callback: Callable[[CallStateModel], Awaitable[None]],
-    training_callback: Callable[[CallStateModel], Awaitable[None]],
 ) -> None:
     # If only one language is available, skip the IVR
     if len(CONFIG.conversation.initiate.lang.availables) == 1:
@@ -603,8 +585,6 @@ async def _handle_ivr_language(
             call=call,
             client=client,
             label=short_code,
-            post_callback=post_callback,
-            training_callback=training_callback,
         )
         return
 

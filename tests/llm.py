@@ -284,8 +284,6 @@ async def test_llm(  # noqa: PLR0913
         call=call,
         client=automation_client,
         label=call.lang.short_code,
-        post_callback=_post_callback,
-        training_callback=_training_callback,
     )
 
     # Simulate conversation with speech recognition

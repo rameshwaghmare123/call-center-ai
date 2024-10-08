@@ -58,9 +58,9 @@ OpenAIInstrumentor().instrument()  # Instrument OpenAI
 environ["TIKTOKEN_CACHE_DIR"] = resources_dir("tiktoken")
 
 logger.info(
-    "Using LLM models %s (slow) and %s (fast)",
-    CONFIG.llm.selected(False).model,
-    CONFIG.llm.selected(True).model,
+    "Using LLM models %s (realtime) and %s (sequential)",
+    CONFIG.llm.realtime.model,
+    CONFIG.llm.sequential.model,
 )
 
 T = TypeVar("T")

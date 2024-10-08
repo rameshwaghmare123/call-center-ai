@@ -17,25 +17,6 @@ from models.synthesis import SynthesisModel
 from models.training import TrainingModel
 
 
-class SoundModel(BaseModel):
-    loading_tpl: str = "{public_url}/loading.wav"
-    ready_tpl: str = "{public_url}/ready.wav"
-
-    def loading(self) -> str:
-        from helpers.config import CONFIG
-
-        return self.loading_tpl.format(
-            public_url=CONFIG.resources.public_url,
-        )
-
-    def ready(self) -> str:
-        from helpers.config import CONFIG
-
-        return self.ready_tpl.format(
-            public_url=CONFIG.resources.public_url,
-        )
-
-
 class LlmModel(BaseModel):
     """
     Introduce to Assistant who they are, what they do.
@@ -604,5 +585,4 @@ class TtsModel(BaseModel):
 
 class PromptsModel(BaseModel):
     llm: LlmModel = LlmModel()  # Object is fully defined by default
-    sounds: SoundModel = SoundModel()  # Object is fully defined by default
     tts: TtsModel = TtsModel()  # Object is fully defined by default
