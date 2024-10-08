@@ -36,7 +36,6 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from htmlmin.minify import html_minify
 from jinja2 import Environment, FileSystemLoader
 from pydantic import Field, TypeAdapter, ValidationError
-from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from twilio.twiml.messaging_response import MessagingResponse
@@ -374,6 +373,7 @@ async def call_get(call_id_or_phone_number: str) -> CallGetModel:
             status_code=HTTPStatus.NOT_FOUND,
         )
     return TypeAdapter(CallGetModel).dump_python(call)
+
 
 @api.post(
     "/call",
@@ -733,8 +733,8 @@ async def _communicationservices_event_worker(  # noqa: PLR0912, PLR0915
                 call=call,
                 client=automation_client,
                 contexts=operation_contexts,
-                post_callback=_post_callback,
-                training_callback=_training_callback,
+                post_callback=_trigger_post_event,
+                training_callback=_trigger_training_event,
             )
         else:  # Unknown error
             await on_recognize_unknown_error(
