@@ -67,7 +67,7 @@ curl \
 - [x] Has access to a documentation database (few-shot training / RAG)
 - [x] Help the user to find the information needed to complete the claim
 - [x] Jailbreak detection
-- [x] Lower AI Search cost by usign a Redis cache
+- [x] Lower AI Search cost by using a Redis cache
 - [x] Monitoring and tracing with Application Insights
 - [x] Perform user tests with feature flags
 - [x] Receive SMS during a conversation for explicit wordings
